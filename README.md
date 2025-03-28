@@ -1,5 +1,7 @@
 # Email Site Reminders
 
+NOTE: This module was made entirely via AI on March 27, 2025. 
+
 **Email Site Reminders** is a Backdrop CMS module that sends periodic email reports to site administrators. These reports can include:
 
 - A list of unpublished content
