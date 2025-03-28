@@ -1,0 +1,4 @@
+This project is GPL v2 software. See the LICENSE.txt file in the Backdrop CMS core for full license text.
+
+This module is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.

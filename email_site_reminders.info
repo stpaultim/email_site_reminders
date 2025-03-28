@@ -1,0 +1,5 @@
+name = Email Site Reminders
+description = Sends periodic email reminders about site content, such as unpublished nodes and available updates.
+package = Custom
+type = module
+backdrop = 1.x

@@ -1,0 +1,406 @@
+<?php
+
+/**
+ * Implements hook_menu().
+ */
+function email_site_reminders_menu() {
+  $items['admin/config/content/email-site-reminders'] = [
+    'title' => 'Email Site Reminders Settings',
+    'description' => 'Configure who receives reminder emails about unpublished content and available updates.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => ['email_site_reminders_settings_form'],
+    'access arguments' => ['administer site configuration'],
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'email_site_reminders.module',
+    'file path' => drupal_get_path('module', 'email_site_reminders'),
+    'weight' => 10,
+    'parent' => 'admin/config/content',
+  ];
+  return $items;
+}
+
+function email_site_reminders_get_update_report($html = FALSE) {
+  module_load_include('inc', 'update', 'update.compare');
+  $projects = update_get_projects();
+  $available = update_get_available();
+  $output = [];
+
+  foreach ($projects as $key => $project) {
+    if (!isset($available[$key]) || !isset($available[$key]['releases'])) {
+      continue;
+    }
+
+    $recommended = update_calculate_project_update_status($project);
+    if ($recommended != UPDATE_NOT_SECURE && $recommended != UPDATE_AVAILABLE) {
+      continue;
+    }
+
+    $installed_version = $project['info']['version'];
+    $latest_release = $available[$key]['releases'][$available[$key]['recommended']];
+
+    if ($html) {
+      $output[] = "<li><strong>{$project['title']}</strong> (Installed: {$installed_version}, Latest: {$latest_release['version']})</li>";
+    } else {
+      $output[] = "{$project['title']} (Installed: {$installed_version}, Latest: {$latest_release['version']})";
+    }
+  }
+
+  if (empty($output)) {
+    return $html ? "<h2>🔄 Available Updates</h2><p>No module or theme updates are available.</p>" : "\n\n-------- 🔄 AVAILABLE UPDATES ------------------------------------------\n" . "No module or theme updates are available.";
+  }
+
+  return $html
+    ? "<h2>🔄 Available Updates</h2><ul>" . implode('', $output) . "</ul>"
+    : "The following modules or themes have updates available:
+
+" . implode("\n", $output);
+}
+
+/**
+ * Implements hook_cron().
+ */
+function email_site_reminders_cron() {
+  $frequency = config_get('email_site_reminders.settings', 'send_frequency');
+  $last_sent = state_get('email_site_reminders_last_sent', 0);
+  $now = REQUEST_TIME;
+
+  $intervals = [
+    'daily' => 86400,
+    'weekly' => 604800,
+    'monthly' => 2592000,
+  ];
+  $wait_time = isset($intervals[$frequency]) ? $intervals[$frequency] : $intervals['daily'];
+
+  if ($now - $last_sent < $wait_time) {
+    return;
+  }
+
+  $query = db_select('node', 'n')
+    ->fields('n', ['nid', 'title', 'type', 'created'])
+    ->condition('status', 0)
+    ->range(0, 50);
+  $results = $query->execute()->fetchAll();
+
+  $html = config_get('email_site_reminders.settings', 'html_email');
+  $include_updates = config_get('email_site_reminders.settings', 'include_updates');
+
+  $body = $html ? "<h2>📝 Unpublished Content</h2><ul>" : "Unpublished content on your site:
+
+";
+
+  if (!empty($results)) {
+    foreach ($results as $row) {
+      $line = $html
+        ? "<li><strong>{$row->title}</strong> (Type: {$row->type}, Created: " . format_date($row->created, 'short') . ")</li>"
+        : "{$row->title} (Type: {$row->type}, Created: " . format_date($row->created, 'short') . ")";
+      $body .= $html ? $line : $line . "\n";
+    }
+
+    if ($html) {
+      $body .= "</ul>";
+    }
+  } else {
+    $body .= $html ? "<li>None</li></ul>" : "None";
+  }
+
+  if ($include_updates) {
+    $body .= $html ? email_site_reminders_get_update_report(TRUE) : "\n\n" . email_site_reminders_get_update_report(FALSE);
+  }
+
+  $emails_raw = config_get('email_site_reminders.settings', 'recipient_emails');
+  $emails = array_filter(array_map('trim', explode("\n", (string) $emails_raw)));
+
+  foreach ($emails as $email) {
+    backdrop_mail('email_site_reminders', 'daily_report', $email, language_default(), [
+      'body' => $body,
+      'html' => $html,
+    ]);
+  }
+
+  $include_new_users = config_get('email_site_reminders.settings', 'include_new_users');
+  $include_recent_nodes = config_get('email_site_reminders.settings', 'include_recent_nodes');
+
+  if ($include_new_users) {
+    $body .= $html ? email_site_reminders_get_new_users($last_sent, TRUE) : "\n\n" . email_site_reminders_get_new_users($last_sent, FALSE);
+  }
+
+  if ($include_recent_nodes) {
+    $body .= $html ? email_site_reminders_get_recent_nodes($last_sent, TRUE) : "\n\n" . email_site_reminders_get_recent_nodes($last_sent, FALSE);
+  }
+
+  $include_recent_comments = config_get('email_site_reminders.settings', 'include_recent_comments');
+
+  if ($include_recent_comments) {
+    $body .= $html ? email_site_reminders_get_recent_comments($last_sent, TRUE) : "\n\n" . email_site_reminders_get_recent_comments($last_sent, FALSE);
+  }
+
+  state_set('email_site_reminders_last_sent', $now);
+}
+
+/**
+ * Implements hook_mail().
+ */
+function email_site_reminders_mail($key, &$message, $params) {
+  switch ($key) {
+    case 'daily_report':
+      $message['subject'] = config_get('email_site_reminders.settings', 'email_subject') ?: t('Site reminder email');
+      $message['body'][] = $params['body'];
+      if (!empty($params['html'])) {
+        $message['headers']['Content-Type'] = 'text/html; charset=UTF-8';
+      }
+      break;
+  }
+}
+
+function email_site_reminders_settings_form($form, &$form_state) {
+  $subject = config_get('email_site_reminders.settings', 'email_subject');
+  $emails = config_get('email_site_reminders.settings', 'recipient_emails');
+  $html_enabled = config_get('email_site_reminders.settings', 'html_email');
+  $frequency = config_get('email_site_reminders.settings', 'send_frequency');
+  $include_updates = config_get('email_site_reminders.settings', 'include_updates');
+
+  $form['email_subject'] = [
+    '#type' => 'textfield',
+    '#title' => t('Email subject'),
+    '#description' => t('The subject line of the reminder email.'),
+    '#default_value' => $subject ?: t('Site reminder email'),
+  ];
+
+  $form['recipient_emails'] = [
+    '#type' => 'textarea',
+    '#title' => t('Recipient email addresses'),
+    '#description' => t('Enter one email address per line. These users will receive the reminder email.'),
+    '#default_value' => $emails ?: '',
+  ];
+
+  $form['html_email'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Send email as HTML'),
+    '#default_value' => $html_enabled ?: 0,
+  ];
+
+  $form['include_new_users'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Include new user registrations'),
+    '#default_value' => config_get('email_site_reminders.settings', 'include_new_users') ?: 0,
+  ];
+
+  $form['include_recent_nodes'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Include recently published content'),
+    '#default_value' => config_get('email_site_reminders.settings', 'include_recent_nodes') ?: 0,
+  ];
+
+  $form['include_recent_comments'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Include recent comments'),
+    '#default_value' => config_get('email_site_reminders.settings', 'include_recent_comments') ?: 0,
+  ];
+
+  $form['send_frequency'] = [
+    '#type' => 'select',
+    '#title' => t('Send frequency'),
+    '#description' => t('How often should reminder emails be sent?'),
+    '#options' => [
+      'daily' => t('Daily'),
+      'weekly' => t('Weekly'),
+      'monthly' => t('Monthly'),
+    ],
+    '#default_value' => $frequency ?: 'daily',
+  ];
+
+  $form['include_updates'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Include module/theme update info'),
+    '#default_value' => $include_updates ?: 0,
+  ];
+
+  $form['submit'] = [
+    '#type' => 'submit',
+    '#value' => t('Save configuration'),
+  ];
+
+  $form['send_test'] = [
+    '#type' => 'submit',
+    '#value' => t('Save & send test email'),
+    '#submit' => ['email_site_reminders_settings_form_submit', 'email_site_reminders_send_test_email'],
+  ];
+
+  return $form;
+}
+
+function email_site_reminders_settings_form_submit($form, &$form_state) {
+  config_set('email_site_reminders.settings', 'email_subject', $form_state['values']['email_subject']);
+  config_set('email_site_reminders.settings', 'recipient_emails', $form_state['values']['recipient_emails']);
+  config_set('email_site_reminders.settings', 'html_email', $form_state['values']['html_email']);
+  config_set('email_site_reminders.settings', 'send_frequency', $form_state['values']['send_frequency']);
+  config_set('email_site_reminders.settings', 'include_updates', $form_state['values']['include_updates']);
+  config_set('email_site_reminders.settings', 'include_new_users', $form_state['values']['include_new_users']);
+  config_set('email_site_reminders.settings', 'include_recent_nodes', $form_state['values']['include_recent_nodes']);
+  config_set('email_site_reminders.settings', 'include_recent_comments', $form_state['values']['include_recent_comments']);
+  backdrop_set_message(t('Settings saved.'));
+}
+
+function email_site_reminders_send_test_email($form, &$form_state) {
+  $emails_raw = $form_state['values']['recipient_emails'];
+  $emails = array_filter(array_map('trim', explode("\n", (string) $emails_raw)));
+
+  if (empty($emails)) {
+    backdrop_set_message(t('No recipient email addresses are configured.'), 'error');
+    return;
+  }
+
+  $html = $form_state['values']['html_email'];
+  $include_updates = $form_state['values']['include_updates'];
+
+  $query = db_select('node', 'n')
+    ->fields('n', ['nid', 'title', 'type', 'created'])
+    ->condition('status', 0)
+    ->range(0, 10);
+
+  $results = $query->execute()->fetchAll();
+
+  $body = $html ? "<p><strong>This is a test email from the Email Site Reminders module.</strong> Below is a sample report.</p><h2>📝 Unpublished Content</h2><ul>"
+                : "This is a test email. Here are some unpublished nodes:
+
+";
+
+  if (!empty($results)) {
+    foreach ($results as $row) {
+      $line = $html
+        ? "<li><strong>{$row->title}</strong> (Type: {$row->type}, Created: " . format_date($row->created, 'short') . ")</li>"
+        : "{$row->title} (Type: {$row->type}, Created: " . format_date($row->created, 'short') . ")";
+      $body .= $html ? $line : $line . "\n";
+    }
+
+    if ($html) {
+      $body .= '</ul>';
+    }
+  } else {
+    $body .= $html ? "<li>None</li></ul>" : "None";
+  }
+
+  if ($include_updates) {
+    $body .= $html ? email_site_reminders_get_update_report(TRUE) : "\n\n" . email_site_reminders_get_update_report(FALSE);
+  }
+
+  $include_new_users = config_get('email_site_reminders.settings', 'include_new_users');
+  $include_recent_nodes = config_get('email_site_reminders.settings', 'include_recent_nodes');
+
+  if ($include_new_users) {
+    $body .= $html ? email_site_reminders_get_new_users(REQUEST_TIME - 86400, TRUE) : "\n\n" . email_site_reminders_get_new_users(REQUEST_TIME - 86400, FALSE);
+  }
+
+  if ($include_recent_nodes) {
+    $body .= $html ? email_site_reminders_get_recent_nodes(REQUEST_TIME - 86400, TRUE) : "\n\n" . email_site_reminders_get_recent_nodes(REQUEST_TIME - 86400, FALSE);
+  }
+
+  $include_recent_comments = config_get('email_site_reminders.settings', 'include_recent_comments');
+
+  if ($include_recent_comments) {
+    $body .= $html ? email_site_reminders_get_recent_comments(REQUEST_TIME - 86400, TRUE) : "\n\n" . email_site_reminders_get_recent_comments(REQUEST_TIME - 86400, FALSE);
+  }
+
+  $email = reset($emails);
+  backdrop_mail('email_site_reminders', 'daily_report', $email, language_default(), [
+    'body' => $body,
+    'html' => $html,
+  ]);
+
+  backdrop_set_message(t('Test email sent to %email.', ['%email' => $email]));
+}
+
+function email_site_reminders_get_new_users($since, $html = FALSE) {
+  $query = db_select('users', 'u')
+    ->fields('u', ['uid', 'name', 'created'])
+    ->condition('uid', 0, '>') // skip anonymous
+    ->condition('created', $since, '>')
+    ->orderBy('created', 'DESC')
+    ->range(0, 20);
+  $users = $query->execute()->fetchAll();
+
+  if (empty($users)) {
+    return $html ? "<h2>👤 New User Registrations</h2><p>No new user registrations since last reminder.</p>" : "\n\n-------- 👤 NEW USER REGISTRATIONS -------------------------------------\n" . "No new user registrations since last reminder.";
+  }
+
+  $lines = [];
+  foreach ($users as $user) {
+    $date = format_date($user->created, 'short');
+    $line = $html
+      ? "<li><strong>{$user->name}</strong> (Registered: {$date})</li>"
+      : "{$user->name} (Registered: {$date})";
+    $lines[] = $line;
+  }
+
+  return $html
+    ? "<h2>👤 New User Registrations</h2><ul>" . implode('', $lines) . "</ul>"
+    : "New user registrations:
+
+" . implode("\n", $lines);
+}
+
+function email_site_reminders_get_recent_nodes($since, $html = FALSE) {
+  $query = db_select('node', 'n')
+    ->fields('n', ['nid', 'title', 'type', 'uid', 'created'])
+    ->condition('status', 1)
+    ->condition('created', $since, '>')
+    ->orderBy('created', 'DESC')
+    ->range(0, 20);
+  $nodes = $query->execute()->fetchAll();
+
+  if (empty($nodes)) {
+    return $html ? "<h2>📢 Recently Published Content</h2><p>No new content published since last reminder.</p>" : "\n\n-------- 📢 RECENTLY PUBLISHED CONTENT ---------------------------------\n" . "No new content published since last reminder.";
+  }
+
+  $lines = [];
+  foreach ($nodes as $node) {
+    $author = format_username(user_load($node->uid));
+    $date = format_date($node->created, 'short');
+    $line = $html
+      ? "<li><strong>{$node->title}</strong> ({$node->type}) by {$author} ({$date})</li>"
+      : "{$node->title} ({$node->type}) by {$author} ({$date})";
+    $lines[] = $line;
+  }
+
+  return $html
+    ? "<h2>📢 Recently Published Content</h2><ul>" . implode('', $lines) . "</ul>"
+    : "Recently published content:
+
+" . implode("\n", $lines);
+}
+
+function email_site_reminders_get_recent_comments($since, $html = FALSE) {
+  $query = db_select('comment', 'c')
+    ->fields('c', ['cid', 'subject', 'nid', 'uid', 'created'])
+    ->condition('status', 1)
+    ->condition('created', $since, '>')
+    ->orderBy('created', 'DESC')
+    ->range(0, 20);
+  $comments = $query->execute()->fetchAll();
+
+  if (empty($comments)) {
+    return $html
+      ? "<h2>💬 Recent Comments</h2><p>No new comments since the last reminder.</p>"
+      : "\n\n-------- 💬 RECENT COMMENTS --------------------------------------------\n" . "No new comments since the last reminder.";
+  }
+
+  $lines = [];
+  foreach ($comments as $comment) {
+    $node = node_load($comment->nid);
+    $username = format_username(user_load($comment->uid));
+    $date = format_date($comment->created, 'short');
+    $title = $comment->subject ?: '[No subject]';
+
+    $line = $html
+      ? "<li><strong>{$title}</strong> on <em>{$node->title}</em> by {$username} ({$date})</li>"
+      : "{$title} on \"{$node->title}\" by {$username} ({$date})";
+
+    $lines[] = $line;
+  }
+
+  return $html
+    ? "<h2>💬 Recent Comments</h2><ul>" . implode('', $lines) . "</ul>"
+    : "Recent comments since last reminder:
+
+" . implode("\n", $lines);
+}
